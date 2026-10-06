@@ -1,0 +1,428 @@
+// json2dir: create the directory tree a JSON document describes, in the current directory.
+// Implements RFC J2D-1 (https://github.com/kitsunoff/awesome-json2dir/blob/main/spec/rfc-json2dir.md).
+// Cforall (C-for-all) with POSIX libc for the file system; hand-written UTF-8 check and JSON parser.
+
+#include <fstream.hfa>
+#include <stdlib.hfa>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+extern "C" {
+#include <sys/stat.h>							// not wrapped by cfa's stdhdr
+}
+
+// ---------- errors: one exception type, thrown anywhere, caught in main ----------
+
+exception json2dir_error { const char * msg; };
+vtable( json2dir_error ) json2dir_error_vt;
+
+void fail( const char * spec, ... ) {
+	char * msg = 0p;
+	va_list ap;
+	va_start( ap, spec );
+	vasprintf( &msg, spec, ap );
+	va_end( ap );
+	throw (json2dir_error){ &json2dir_error_vt, msg };
+}
+
+// ---------- byte strings: a growable buffer with constructor/destructor and operators ----------
+
+struct Bytes { char * data; size_t len, cap; };
+
+void ?{}( Bytes & b ) { b.data = 0p; b.len = 0; b.cap = 0; }
+
+void reserve( Bytes & b, size_t n ) with ( b ) {
+	if ( len + n + 1 <= cap ) return;
+	cap = ( len + n + 1 ) * 2;
+	data = (char *)realloc( data, cap );
+}
+Bytes & ?+=?( Bytes & b, char c ) with ( b ) { reserve( b, 1 ); data[len++] = c; data[len] = '\0'; return b; }
+Bytes & ?+=?( Bytes & b, const char * s ) with ( b ) {
+	size_t n = strlen( s ); reserve( b, n ); memcpy( data + len, s, n ); len += n; data[len] = '\0'; return b;
+}
+Bytes & ?+=?( Bytes & b, Bytes & o ) with ( b ) {			// by reference: a by-value Bytes would recurse into the copy constructor
+	reserve( b, o.len ); if ( o.len ) memcpy( data + len, o.data, o.len ); len += o.len; data[len] = '\0'; return b;
+}
+void ?{}( Bytes & b, const char * s ) { ?{}( b ); b += s; }
+void ?{}( Bytes & b, char * s ) { ?{}( b, (const char *)s ); }	// string literals are char[]
+void ?{}( Bytes & b, Bytes other ) { ?{}( b ); b += other; }		// copy: deep
+void ^?{}( Bytes & b ) { free( b.data ); }
+Bytes & ?=?( Bytes & b, Bytes other ) {
+	if ( &b == &other ) return b;
+	b.len = 0; b += other; return b;
+}
+Bytes ?+?( Bytes a, Bytes b ) { Bytes r = a; r += b; return r; }
+char ?[?]( Bytes & b, size_t i ) { return b.data[i]; }
+int ?==?( Bytes & a, const char * s ) { return a.len == strlen( s ) && memcmp( a.data, s, a.len ) == 0; }
+const char * str( Bytes & b ) { return b.data ? b.data : ""; }
+
+// byte-wise ordering, as the reference implementation sorts names
+// "where" paths for messages: "." + "a" = "a", otherwise "dir" + "/" + "name"
+Bytes join( Bytes & where, Bytes & name ) {
+	if ( where == "." ) return name;
+	Bytes slash = "/";
+	return where + slash + name;
+}
+
+int ?<?( Bytes & a, Bytes & b ) {
+	size_t n = a.len < b.len ? a.len : b.len;
+	int c = n ? memcmp( a.data, b.data, n ) : 0;
+	return c < 0 || ( c == 0 && a.len < b.len );
+}
+
+// ---------- the document model ----------
+
+enum( const char * ) Kind { KObject = "object", KString = "string", KLink = "link", KScript = "script" };
+
+struct Value;
+struct Member { Bytes name; Value * value; };
+struct Value {
+	Kind kind;
+	Bytes text;					// string content, link target or script content
+	Member * members;			// object members
+	size_t count, cap;
+};
+
+void ?{}( Value & v, Kind k ) { v.kind = k; ?{}( v.text ); v.members = 0p; v.count = 0; v.cap = 0; }
+void ^?{}( Value & v ) {
+	for ( i; v.count ) { ^?{}( v.members[i].name ); delete( v.members[i].value ); }
+	free( v.members );
+	^?{}( v.text );
+}
+
+int ?<?( Member & a, Member & b ) { return a.name < b.name; }
+
+// duplicate names: the last occurrence wins (§4.2)
+void add( Value & obj, Bytes & name, Value * value ) with ( obj ) {
+	for ( i; count ) {
+		if ( members[i].name.len == name.len && memcmp( members[i].name.data, name.data, name.len ) == 0 ) {
+			delete( members[i].value );
+			members[i].value = value;
+			return;
+		}
+	}
+	if ( count == cap ) {
+		cap = cap ? cap * 2 : 8;
+		members = (Member *)realloc( members, cap * sizeof( Member ) );
+	}
+	(members[count].name){ name };
+	members[count].value = value;
+	count++;
+}
+
+// a polymorphic insertion sort: works for any T with a less-than and assignment
+forall( T ) trait ordered { int ?<?( T &, T & ); };
+forall( T | ordered( T ) )
+void sort( T * a, size_t n ) {
+	for ( i; 1 ~ n ) {
+		for ( size_t j = i; j > 0; j-- ) {
+			if ( ! ( a[j] < a[j - 1] ) ) break;
+			T t = a[j]; a[j] = a[j - 1]; a[j - 1] = t;
+		}
+	}
+}
+
+// ---------- §3: strict UTF-8 ----------
+
+// returns [ok, length of the sequence at p]
+[ bool, size_t ] utf8_char( const unsigned char * p, size_t left ) {
+	unsigned char c = p[0];
+	if ( c < 0x80 ) return [ true, 1 ];
+	size_t n; unsigned int cp, min;
+	if ( c >= 0xC2 && c <= 0xDF ) { n = 2; cp = c & 0x1F; min = 0x80; }
+	else if ( c >= 0xE0 && c <= 0xEF ) { n = 3; cp = c & 0x0F; min = 0x800; }
+	else if ( c >= 0xF0 && c <= 0xF4 ) { n = 4; cp = c & 0x07; min = 0x10000; }
+	else return [ false, 1 ];
+	if ( n > left ) return [ false, 1 ];
+	for ( i; 1 ~ n ) {
+		if ( ( p[i] & 0xC0 ) != 0x80 ) return [ false, 1 ];
+		cp = ( cp << 6 ) | ( p[i] & 0x3F );
+	}
+	if ( cp < min || cp > 0x10FFFF || ( cp >= 0xD800 && cp <= 0xDFFF ) ) return [ false, 1 ];
+	return [ true, n ];
+}
+
+void check_utf8( Bytes & in ) {
+	const unsigned char * p = (const unsigned char *)in.data;
+	for ( size_t i = 0; i < in.len; ) {
+		bool ok; size_t n;
+		[ ok, n ] = utf8_char( p + i, in.len - i );
+		if ( ! ok ) fail( "input is not valid UTF-8 (byte offset %zu)", i );
+		i += n;
+	}
+}
+
+// ---------- §3, §4: hand-written JSON parser that also validates the scheme ----------
+
+struct Parser { Bytes * in; size_t pos; int depth; };
+
+char ?[?]( Parser & p, size_t i ) { return i < p.in->len ? (*p.in)[i] : '\0'; }		// p[k] peeks
+bool at_end( Parser & p ) { return p.pos >= p.in->len; }
+
+void syntax( Parser & p, const char * what ) { fail( "input is not valid JSON: %s at byte %zu", what, p.pos ); }
+
+void skip_ws( Parser & p ) with ( p ) {
+	while ( ! at_end( p ) ) {
+		char c = p[pos];
+		if ( c != ' ' && c != '\t' && c != '\n' && c != '\r' ) break;
+		pos++;
+	}
+}
+
+void expect( Parser & p, char c ) {
+	skip_ws( p );
+	if ( at_end( p ) || p[p.pos] != c ) {
+		char what[32]; snprintf( what, sizeof( what ), "expected '%c'", c );
+		syntax( p, what );
+	}
+	p.pos++;
+}
+
+int hex4( Parser & p ) with ( p ) {
+	int v = 0;
+	for ( 4 ) {
+		char c = p[pos];
+		int d;
+		if ( c >= '0' && c <= '9' ) d = c - '0';
+		else if ( c >= 'a' && c <= 'f' ) d = c - 'a' + 10;
+		else if ( c >= 'A' && c <= 'F' ) d = c - 'A' + 10;
+		else { syntax( p, "bad \\u escape" ); d = 0; }
+		v = v * 16 + d; pos++;
+	}
+	return v;
+}
+
+void put_utf8( Bytes & out, unsigned int cp ) {
+	if ( cp < 0x80 ) out += (char)cp;
+	else if ( cp < 0x800 ) { out += (char)( 0xC0 | cp >> 6 ); out += (char)( 0x80 | ( cp & 0x3F ) ); }
+	else if ( cp < 0x10000 ) {
+		out += (char)( 0xE0 | cp >> 12 ); out += (char)( 0x80 | ( cp >> 6 & 0x3F ) ); out += (char)( 0x80 | ( cp & 0x3F ) );
+	} else {
+		out += (char)( 0xF0 | cp >> 18 ); out += (char)( 0x80 | ( cp >> 12 & 0x3F ) );
+		out += (char)( 0x80 | ( cp >> 6 & 0x3F ) ); out += (char)( 0x80 | ( cp & 0x3F ) );
+	}
+}
+
+// the input is already valid UTF-8, so raw bytes are copied as they are
+Bytes parse_string( Parser & p ) with ( p ) {
+	expect( p, '"' );
+	Bytes out;
+	for () {
+		if ( at_end( p ) ) syntax( p, "unterminated string" );
+		unsigned char c = p[pos++];
+		if ( c == '"' ) break;
+		if ( c < 0x20 ) syntax( p, "control character in string" );
+		if ( c != '\\' ) { out += (char)c; continue; }
+		char e = p[pos++];
+		choose ( e ) {
+		  case '"': out += '"';
+		  case '\\': out += '\\';
+		  case '/': out += '/';
+		  case 'b': out += '\b';
+		  case 'f': out += '\f';
+		  case 'n': out += '\n';
+		  case 'r': out += '\r';
+		  case 't': out += '\t';
+		  case 'u': {
+			unsigned int cp = hex4( p );
+			if ( cp >= 0xDC00 && cp <= 0xDFFF ) fail( "string contains an unpaired surrogate (byte %zu)", pos );
+			if ( cp >= 0xD800 && cp <= 0xDBFF ) {
+				if ( p[pos] != '\\' || p[pos + 1] != 'u' ) fail( "string contains an unpaired surrogate (byte %zu)", pos );
+				pos += 2;
+				unsigned int lo = hex4( p );
+				if ( lo < 0xDC00 || lo > 0xDFFF ) fail( "string contains an unpaired surrogate (byte %zu)", pos );
+				cp = 0x10000 + ( ( cp - 0xD800 ) << 10 ) + ( lo - 0xDC00 );
+			}
+			put_utf8( out, cp );
+		  }
+		  default: syntax( p, "bad escape" );
+		}
+	}
+	return out;
+}
+
+// §4.2.1: names are used exactly
+void check_name( Bytes & name, Bytes & where ) {
+	if ( name.len == 0 || name == "." || name == ".." || memchr( name.data, '/', name.len ) || memchr( name.data, 0, name.len ) )
+		fail( "%s: invalid name", str( where ) );
+}
+
+Value * parse_value( Parser & p, Bytes & where );
+
+Value * parse_object( Parser & p, Bytes & where ) with ( p ) {
+	expect( p, '{' );
+	if ( ++depth > 1000 ) syntax( p, "nesting too deep" );
+	Value * obj = new( KObject );
+	skip_ws( p );
+	if ( p[pos] == '}' ) { pos++; depth--; return obj; }
+	for () {
+		skip_ws( p );
+		Bytes name;									// constructed first: a throw inside an initializer would destroy garbage
+		name = parse_string( p );
+		Bytes child = join( where, name );
+		check_name( name, child );
+		expect( p, ':' );
+		add( *obj, name, parse_value( p, child ) );
+		skip_ws( p );
+		if ( p[pos] == ',' ) { pos++; continue; }
+		expect( p, '}' );
+		break;
+	}
+	depth--;
+	return obj;
+}
+
+// §4.4: exactly ["link", target] or ["script", content]
+Value * parse_array( Parser & p, Bytes & where ) with ( p ) {
+	expect( p, '[' );
+	skip_ws( p );
+	if ( p[pos] != '"' ) fail( "%s: an array must be [\"link\", target] or [\"script\", content]", str( where ) );
+	Bytes kind;									// constructed first: a throw inside an initializer would destroy garbage
+	kind = parse_string( p );
+	expect( p, ',' );
+	skip_ws( p );
+	if ( p[pos] != '"' ) fail( "%s: an array must be [\"link\", target] or [\"script\", content]", str( where ) );
+	Bytes payload;									// constructed first: a throw inside an initializer would destroy garbage
+	payload = parse_string( p );
+	skip_ws( p );
+	if ( p[pos] != ']' ) fail( "%s: an array must be [\"link\", target] or [\"script\", content]", str( where ) );
+	pos++;
+	Value * v;
+	if ( kind == "link" ) {
+		if ( memchr( payload.data, 0, payload.len ) ) fail( "%s: a link target cannot contain NUL", str( where ) );
+		v = new( KLink );
+	} else if ( kind == "script" ) v = new( KScript );
+	else fail( "%s: unknown array kind \"%s\"", str( where ), str( kind ) );
+	v->text = payload;
+	return v;
+}
+
+Value * parse_value( Parser & p, Bytes & where ) {
+	skip_ws( p );
+	if ( at_end( p ) ) syntax( p, "unexpected end of input" );
+	char c = p[p.pos];
+	if ( c == '{' ) return parse_object( p, where );
+	if ( c == '[' ) return parse_array( p, where );
+	if ( c == '"' ) { Value * v = new( KString ); v->text = parse_string( p ); return v; }
+	if ( c == '-' || ( c >= '0' && c <= '9' ) || c == 't' || c == 'f' || c == 'n' )
+		fail( "%s: numbers, booleans and null are not allowed", str( where ) );
+	syntax( p, "unexpected character" );
+	return 0p;
+}
+
+Value * parse_document( Bytes & in ) {
+	check_utf8( in );
+	Parser p = { &in, 0, 0 };
+	if ( in.len >= 3 && memcmp( in.data, "\xEF\xBB\xBF", 3 ) == 0 ) p.pos = 3;	// §3: a BOM may be ignored
+	skip_ws( p );
+	if ( at_end( p ) ) syntax( p, "empty input" );
+	if ( p[p.pos] != '{' ) fail( "the root of the document must be an object" );
+	Bytes root = ".";
+	Value * doc = parse_value( p, root );
+	skip_ws( p );
+	if ( ! at_end( p ) ) syntax( p, "trailing data after the document" );
+	return doc;
+}
+
+// ---------- §4, §5: build the tree with POSIX *at() calls relative to directory fds ----------
+
+void write_all( int fd, Bytes & b, Bytes & where ) {
+	for ( size_t off = 0; off < b.len; ) {
+		ssize_t n = write( fd, b.data + off, b.len - off );
+		if ( n < 0 ) { if ( errno == EINTR ) continue; fail( "%s: write failed: %s", str( where ), strerror( errno ) ); }
+		off += n;
+	}
+}
+
+// §5.2, §5.3, §5.4: remove an existing non-directory (a symlink itself, never its target)
+void clear( int dir, Bytes & name, Bytes & where ) {
+	struct stat st;
+	if ( fstatat( dir, name.data, &st, AT_SYMLINK_NOFOLLOW ) != 0 ) {
+		if ( errno == ENOENT ) return;
+		fail( "%s: %s", str( where ), strerror( errno ) );
+	}
+	if ( S_ISDIR( st.st_mode ) ) fail( "%s: a directory is in the way", str( where ) );
+	if ( unlinkat( dir, name.data, 0 ) != 0 ) fail( "%s: cannot remove: %s", str( where ), strerror( errno ) );
+}
+
+void make_file( int dir, Bytes & name, Bytes & content, bool executable, Bytes & where ) {
+	// O_EXCL: never writes through an entry that appeared after clear()
+	int fd = openat( dir, name.data, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0666 );
+	if ( fd < 0 ) fail( "%s: cannot create: %s", str( where ), strerror( errno ) );
+	write_all( fd, content, where );
+	if ( executable ) {
+		struct stat st;
+		if ( fstat( fd, &st ) != 0 || fchmod( fd, ( st.st_mode & 07777 ) | 0111 ) != 0 )
+			fail( "%s: cannot chmod: %s", str( where ), strerror( errno ) );
+	}
+	close( fd );
+}
+
+void apply( int dir, Value & tree, Bytes & where ) {
+	sort( tree.members, tree.count );
+	for ( i; tree.count ) {
+		Member & m = tree.members[i];
+		Value & v = *m.value;
+		Bytes path = join( where, m.name );
+		if ( v.kind == KObject ) {
+			struct stat st;
+			bool is_dir = fstatat( dir, m.name.data, &st, AT_SYMLINK_NOFOLLOW ) == 0 && S_ISDIR( st.st_mode );
+			if ( ! is_dir ) {
+				clear( dir, m.name, path );
+				if ( mkdirat( dir, m.name.data, 0777 ) != 0 ) fail( "%s: cannot create directory: %s", str( path ), strerror( errno ) );
+			}
+			int sub = openat( dir, m.name.data, O_RDONLY | O_DIRECTORY | O_NOFOLLOW );
+			if ( sub < 0 ) fail( "%s: cannot open directory: %s", str( path ), strerror( errno ) );
+			apply( sub, v, path );
+			close( sub );
+		} else {
+			clear( dir, m.name, path );
+			if ( v.kind == KLink ) {
+				if ( symlinkat( v.text.data ? v.text.data : "", dir, m.name.data ) != 0 )
+					fail( "%s: cannot create link: %s", str( path ), strerror( errno ) );
+			} else make_file( dir, m.name, v.text, v.kind == KScript, path );
+		}
+	}
+}
+
+// ---------- §7: command-line interface ----------
+
+Bytes read_stdin() {
+	Bytes in;
+	char buf[65536];
+	for () {
+		ssize_t n = read( 0, buf, sizeof( buf ) );
+		if ( n < 0 ) { if ( errno == EINTR ) continue; fail( "cannot read standard input: %s", strerror( errno ) ); }
+		if ( n == 0 ) break;
+		reserve( in, n );
+		memcpy( in.data + in.len, buf, n );
+		in.len += n;
+		in.data[in.len] = '\0';
+	}
+	return in;
+}
+
+int main( int argc, char * argv[] ) {
+	(void)argv;
+	if ( argc > 1 ) {
+		serr | "usage: json2dir < document.json";
+		return 2;
+	}
+	try {
+		Bytes in;
+		in = read_stdin();
+		Value * doc = parse_document( in );
+		Bytes root = ".";
+		apply( AT_FDCWD, *doc, root );
+		delete( doc );
+	} catch ( json2dir_error * e ) {
+		serr | "json2dir: " | e->msg;
+		free( (char *)e->msg );
+		return 1;
+	}
+	return 0;
+}
